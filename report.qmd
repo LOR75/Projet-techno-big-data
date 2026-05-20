@@ -1,0 +1,752 @@
+---
+title: "Analyse Stylométrique Comparative — Romantisme vs Réalisme"
+subtitle: "Rapport de projet — Spark NLP & Big Data"
+author: "Degraeve Xavier & Djoua Nem Steeve"
+date: today
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    toc-location: left
+    number-sections: true
+    theme: cosmo
+    code-fold: true
+    code-tools: true
+    self-contained: true
+    fig-width: 10
+    fig-height: 6
+jupyter: python3
+execute:
+  echo: false
+  warning: false
+  message: false
+---
+
+```{python}
+#| label: setup
+#| include: false
+
+# ── Dépendances légères (sans Spark) ──────────────────────────────────────
+# Installation si nécessaire :
+#   pip install pandas pyarrow plotly numpy
+import os
+import pandas as pd
+import numpy as np
+import plotly.express as px
+import plotly.graph_objects as go
+from IPython.display import display, Markdown
+import warnings
+warnings.filterwarnings("ignore")
+
+# pyarrow : requis pour lire Parquet et ORC
+try:
+    import pyarrow as pa
+    import pyarrow.orc as orc_module
+    HAS_PYARROW = True
+except ImportError:
+    HAS_PYARROW = False
+    display(Markdown(
+        "> **pyarrow non installé.** "
+        "Lancez `pip install pyarrow` dans votre venv puis relancez `quarto render`."
+    ))
+
+# ── Chemins vers les données sauvegardées ─────────────────────────────────
+PARQUET_RAW       = "data/parquet/raw_corpus"
+PARQUET_ANNOTATED = "data/parquet/annotated_corpus"
+PARQUET_SLIDING   = "data/parquet/sliding_readability"
+ORC_STYLOMETRY    = "data/orc/stylometry"
+
+# ── Chemin vers les sources Python (pour l'appendice) ─────────────────────
+SRC_DIR = "."   # répertoire contenant les .py du projet
+
+
+# ── Lecture Parquet ────────────────────────────────────────────────────────
+def read_parquet(path, filters=None):
+    """
+    Lit un répertoire Parquet (éventuellement partitionné à la Spark)
+    en DataFrame Pandas via pyarrow.
+    Le paramètre `filters` active le predicate pushdown :
+        filters=[("genre", "==", "romantic")]
+    → seul le sous-dossier genre=romantic/ est lu.
+    """
+    if not os.path.exists(path):
+        raise FileNotFoundError(
+            f"Répertoire Parquet introuvable : {path}\n"
+            "→ Exécutez d'abord main.py pour générer les données."
+        )
+    return pd.read_parquet(path, filters=filters)
+
+
+# ── Lecture ORC ────────────────────────────────────────────────────────────
+def read_orc(path):
+    """
+    Lit tous les fichiers .orc d'un répertoire et les concatène.
+    Spark écrit l'ORC en fichiers multiples (part-xxxxx.orc) ;
+    on les assemble ici en un seul DataFrame Pandas.
+
+    Fallback : si pyarrow.orc échoue (format Spark parfois non standard),
+    on tente une lecture via pandas avec le moteur 'pyarrow'.
+    """
+    if not os.path.exists(path):
+        raise FileNotFoundError(
+            f"Répertoire ORC introuvable : {path}\n"
+            "→ Exécutez d'abord main.py pour générer les données."
+        )
+
+    orc_files = [
+        os.path.join(path, f)
+        for f in os.listdir(path)
+        if f.endswith(".orc")
+    ]
+    if not orc_files:
+        raise FileNotFoundError(f"Aucun fichier .orc dans {path}")
+
+    # Tentative 1 : pyarrow.orc natif
+    if HAS_PYARROW:
+        try:
+            tables = [orc_module.read_table(f) for f in orc_files]
+            return pa.concat_tables(tables).to_pandas()
+        except Exception:
+            pass  # → fallback
+
+    # Tentative 2 : pandas.read_orc (pandas >= 1.5, requiert pyarrow)
+    try:
+        frames = [pd.read_orc(f) for f in orc_files]
+        return pd.concat(frames, ignore_index=True)
+    except Exception as e:
+        raise RuntimeError(
+            f"Impossible de lire les fichiers ORC dans {path}.\n"
+            f"Erreur : {e}\n"
+            "→ Vérifiez que pyarrow >= 7.0 est installé : pip install 'pyarrow>=7.0'"
+        )
+
+
+# ── Chargement de toutes les tables ───────────────────────────────────────
+df_raw       = read_parquet(PARQUET_RAW)
+df_annotated = read_parquet(PARQUET_ANNOTATED)
+df_sliding   = read_parquet(PARQUET_SLIDING)
+df_stylo     = read_orc(ORC_STYLOMETRY)
+
+# ── Palette cohérente auteurs ──────────────────────────────────────────────
+AUTHORS    = sorted(df_annotated["author"].unique())
+COLORS     = px.colors.qualitative.Plotly
+COLOR_MAP  = {a: COLORS[i % len(COLORS)] for i, a in enumerate(AUTHORS)}
+SYMBOL_MAP = {"romantic": "circle", "realism": "x"}
+TEMPLATE   = "plotly_white"
+```
+
+# Introduction — Données et pipeline d'extraction {#sec-intro}
+
+## Corpus
+
+Notre corpus est composé d'oeuvres écrites par 6 auteurs :
+
+- **Romantiques** :  Balzac, Dumas, Sand
+- **Réalisme** : Zola, Dickens, Maupassant
+
+Les textes proviennent de trois sources libres de droits :
+
+
+| Source | Format | Auteurs |
+|---|---|---|
+| Bibliothèque électronique du Québec (BEQ) | EPUB | Dumas, Zola, Dickens, Maupassant |
+| GitHub dh-trier/balzac | TXT (UTF-8) | Balzac |
+| Project Gutenberg | TXT (UTF-8) | Balzac (Comédie humaine) |
+
+
+
+Grâce à ces sites, nous avons accès à un large corpus. Néanmoins, nous avons
+limité le corpus à 10 livres par auteur. Cette borne est facilement modifiable
+depuis le script main.
+
+
+## Pipeline d'extraction
+
+L'extraction suit trois chemins selon la source :
+
+1- Sur le site ebooksgratuits, nous parcourant simplement les pages qui donnent accès aux
+livres d'un même auteur. Ce site fournit des fichiers au format epub. Il faut donc ensuite
+extraire le texte avec la fonction `epub.read_epub()` de ebooklib
+
+2- Pour github et Gutenberg, le format du site nous fait passer par des requêtes intermédiaires
+Ces sites fournissent des fichier .txt
+
+Toutes les fonctions liées à la création du corpus sont dans le fichier `create_corpus.py`
+
+
+On opère une troncature à 300 000 caractères pour éviter d'avoir des textes de taille
+trop importante. Pour Flesch et Zipf, cette taille est largement suffisante.
+
+La session HTTP réalise des requêtes robustes avec des délais maximum de connexion. Cela
+évite de faire planter le code si l'un des sites ferme.
+
+---
+
+# Pipeline de chargement et transformation {#sec-load}
+
+## Architecture générale
+
+Le corpus étant de taille importante, nous utilisons `.cache()` pour éviter de recalculer
+les transformations coûteuses à chaque action. `.cache()` consomme de la
+mémoire JVM mais économise du temps de calcul.
+
+```
+corpus list[tuple]
+     │
+     ▼  build_df()  [create_pipeline.py]
+  DataFrame Spark brut
+  (id, author, title, genre, text)
+     │
+     ├──► .cache()  ← matérialisation en mémoire
+     │
+     ▼  pipeline.fit(df).transform(df)
+  DataFrame annoté
+  (+ document, sentence, token, pos)
+     │
+     ├──► .cache()
+     │
+     ▼  withColumn() × 5
+  DataFrame enrichi
+  (+ word_count, sentence_count, syllable_count,
+     flesch_score, km_score)
+```
+
+## Construction du DataFrame
+
+`build_df()` convertit la liste Python de tuples en un DataFrame Spark via
+`spark.createDataFrame(rows)`.
+
+1. PySpark sérialise les `Row` Python en objets JVM via Arrow
+   ou le serializer Pickle par défaut.
+2. Un RDD est créé en mémoire, puis un DataFrame
+3. Avec `master("local[*]")`, toutes les partitions résident sur le driver
+
+
+## Configurations Spark
+
+```python
+spark.conf.set("spark.sql.shuffle.partitions", "20")
+spark.conf.set("spark.default.parallelism", "20")
+```
+Nous avons configuré spark avec des processus à 20
+coeurs. L'execution étant locale, il ne nous a
+pas semblé utile d'en mettre d'avantage.
+
+
+
+## Sauvegarde : choix des formats
+
+
+**Pourquoi Parquet pour les tables volumineuses ?**
+
+Les requêtes analytiques de ce projet lisent rarement toutes les colonnes.
+`.select("flesch_score", "author")` sur un fichier Parquet ne lit que deux
+colonnes sur les vingt du fichier. Ce format est donc bien plus interessant
+qu'un fichier CSV au niveau des performances.
+
+**Partitionnement :**
+
+- `annotated_corpus` → partitionné par `genre` : les requêtes comparatives
+  Romantisme/Réalisme ne lisent qu'un des deux sous-dossiers.
+- `sliding_readability` → partitionné par `window_size` : permet de recharger
+  une seule configuration de fenêtre sans lire les autres.
+
+  **Fichiers CSV :**
+
+- Nous avons fait le choix d'utiliser des fichiers CSV pour l'affichage du graphe
+sur la loi de zipf ainsi que la segmentation dialogue / narration. Ces deux tables
+sont produites par Spark puis immédiatement converties en Pandas (`.toPandas()`) dans
+`main.py` — elles ne sont jamais relues par Spark. Le CSV est ici suffisant : taille
+négligeable, pas de dépendance à pyarrow, et lisible directement dans n'importe quel outil.
+
+
+```{python}
+#| label: tbl-sizes
+#| tbl-cap: "Taille des tables sauvegardées"
+
+import shutil
+
+def dir_size_mb(path):
+    if not os.path.exists(path):
+        return None
+    total = sum(
+        os.path.getsize(os.path.join(dp, f))
+        for dp, _, filenames in os.walk(path)
+        for f in filenames
+    )
+    return round(total / 1e6, 2)
+
+size_data = {
+    "Table": ["raw_corpus", "annotated_corpus", "sliding_readability", "stylometry", "zipf.csv", "segmentation.csv"],
+    "Format": ["Parquet", "Parquet (part. genre)", "Parquet (part. window_size)", "ORC", "CSV", "CSV"],
+    "Taille (Mo)": [
+        dir_size_mb(PARQUET_RAW),
+        dir_size_mb(PARQUET_ANNOTATED),
+        dir_size_mb(PARQUET_SLIDING),
+        dir_size_mb(ORC_STYLOMETRY),
+        round(os.path.getsize("data/zipf.csv") / 1e6, 2) if os.path.exists("data/zipf.csv") else None,
+        round(os.path.getsize("data/segmentation.csv") / 1e6, 2) if os.path.exists("data/segmentation.csv") else None,
+    ]
+}
+display(pd.DataFrame(size_data).style.hide(axis="index"))
+```
+
+---
+
+# Pipelines d'annotation {#sec-annotation}
+
+## Spark NLP — Vue d'ensemble
+
+La pipeline NLP est composé de 4 annotateur spark :
+
+
+**1 - DocumentAssembler** : Convertit une colonne `String` en type 
+`Document` compris par tous les annotators NLP suivants.
+
+
+**2 - SentenceDetector** : segmente en phrases
+
+**3 - Tokenizer** : découpe par espaces et ponctuation
+
+**4 - PerceptronModel** : TAG les tokens basé sur un perceptron multi-couches
+pré-entraîné.
+
+### Pipeline de segmentation dialogue/narration
+
+La segmentation est une UDF Python appliquée sur le texte brut. Chaque ligne est
+classifiée comme DIALOG si elle commence par un guillemet ou un tiret cadratin,
+ou contient un fragment entre guillemets — tout le reste est NARRATION. La UDF
+retourne un struct avec le nombre de lignes par catégorie, le ratio dialogue,
+et les textes concaténés.
+
+
+### Pipeline de lisibilité glissante
+
+On découpe la liste de tokens en fenêtres glissantes de taille window_size
+avec un pas step, puis on calcule Flesch et Kandel-Moles sur chaque fenêtre. 
+Le résultat est ensuite exporté en format long (une ligne par fenêtre) 
+pour faciliter les agrégations et visualisations.
+
+---
+
+# Analyse stylométrique {#sec-stylo}
+
+```{python}
+#| label: data-prep-stylo
+#| include: false
+
+# Préparation des données pour toutes les visualisations de cette section
+stylo = df_stylo.copy()
+
+# Table par livre pour le cluster
+books = df_annotated[["id","title","author","genre","flesch_score","km_score","word_count","sentence_count"]].copy()
+books["avg_sent_len"] = books["word_count"] / books["sentence_count"].clip(lower=1)
+
+# Table glissante
+sliding = df_sliding.copy()
+```
+
+## Indices de lisibilité globaux
+
+Les indices de Flesch et Kandel-Moles mesurent deux composantes de la
+complexité : la longueur des phrases (terme en mots/phrases) et la densité
+syllabique des mots (terme en syllabes/mots).
+
+```{python}
+#| label: fig-flesch
+#| fig-cap: "Indice de Flesch moyen par auteur."
+
+fig = px.bar(
+    stylo, x="author", y="avg_flesch", color="genre",
+    barmode="group",
+    color_discrete_map={"romantic": "#636EFA", "realism": "#EF553B"},
+    text_auto=".1f",
+    labels={"author":"Auteur","avg_flesch":"Score Flesch moyen","genre":"Genre"},
+    title="Indice de Flesch moyen par auteur"
+)
+fig.add_hline(y=70, line_dash="dot", line_color="green",
+              annotation_text="Seuil 70 (facile)", annotation_position="top right")
+fig.add_hline(y=30, line_dash="dot", line_color="orange",
+              annotation_text="Seuil 30 (difficile)", annotation_position="top right")
+fig.update_layout(template=TEMPLATE, legend_title="Genre",
+                  yaxis_title="Score Flesch [>70 facile | 30–70 moyen | <30 difficile]")
+fig.show()
+```
+
+```{python}
+#| label: fig-km
+#| fig-cap: "Indice Kandel-Moles moyen par auteur."
+
+fig = px.bar(
+    stylo, x="author", y="avg_km", color="genre",
+    barmode="group",
+    color_discrete_map={"romantic":"#636EFA","realism":"#EF553B"},
+    text_auto=".1f",
+    labels={"author":"Auteur","avg_km":"Score Kandel-Moles moyen","genre":"Genre"},
+    title="Indice Kandel-Moles moyen par auteur"
+)
+fig.update_layout(template=TEMPLATE, legend_title="Genre")
+fig.show()
+```
+
+```{python}
+#| label: tbl-stylo-summary
+#| tbl-cap: "Statistiques stylométriques par auteur et genre"
+
+display(
+    stylo.rename(columns={
+        "author":"Auteur","genre":"Genre",
+        "avg_flesch":"Flesch moy.","avg_km":"KM moy.",
+        "avg_words":"Mots moy.","avg_sentences":"Phrases moy."
+    }).round(2).style.hide(axis="index")
+    .background_gradient(subset=["Flesch moy.","KM moy."], cmap="RdYlGn")
+)
+```
+
+** Analyse :** les scores se situent entre 30 et 70 pour la
+quasi-totalité des auteurs. Les différences entre
+auteurs sont plus marquées que les différences entre genres. On peut 
+supposer que le style individuel domine sur l'appartenance générique 
+pour ces indices.
+
+
+## Complexité structurelle agrégée par auteur
+
+```{python}
+#| label: fig-complexity
+#| fig-cap: "Nuage de points : complexité moyenne par auteur. X = nb moyen de phrases par texte, Y = nb moyen de mots par texte."
+
+fig = px.scatter(
+    stylo,
+    x="avg_sentences", y="avg_words",
+    color="genre", size="avg_words",
+    hover_name="author",
+    color_discrete_map={"romantic":"#636EFA","realism":"#EF553B"},
+    title="Complexité structurelle par auteur — Mots × Phrases (moyenne par texte)",
+    labels={
+        "avg_sentences":"Nb moyen de phrases par texte",
+        "avg_words":"Nb moyen de mots par texte",
+        "genre":"Genre",
+    },
+)
+fig.update_layout(template=TEMPLATE, legend_title="Genre")
+fig.show()
+```
+
+## Complexité structurelle par livre
+
+```{python}
+#| label: fig-complexity-bis
+#| fig-cap: "Nuage de points : un point par livre. Couleur = auteur, ● = romantisme, ✕ = réalisme."
+
+fig = px.scatter(
+    books,
+    x="sentence_count", y="word_count",
+    color="author", symbol="genre",
+    symbol_map=SYMBOL_MAP,
+    hover_name="title",
+    hover_data={
+        "author":True,"genre":True,
+        "word_count":True,"sentence_count":True,
+        "flesch_score":":.2f","km_score":":.2f",
+    },
+    color_discrete_map=COLOR_MAP,
+    title="Complexité structurelle par livre — Mots × Phrases",
+    labels={
+        "sentence_count":"Nombre de phrases",
+        "word_count":"Nombre de mots",
+        "author":"Auteur","genre":"Genre",
+    },
+)
+fig.update_traces(marker=dict(size=8, opacity=0.75))
+fig.update_layout(template=TEMPLATE, legend_title="Auteur")
+fig.show()
+```
+
+## Lisibilité glissante
+
+```{python}
+#| label: fig-sliding-lines
+#| fig-cap: "Évolution du score Flesch au fil du texte (fenêtre 500 tokens, pas 250). Un texte représentatif par auteur."
+
+s500 = sliding[sliding["window_size"] == 500].copy()
+# Un texte par auteur : le premier id alphabétiquement
+first_ids = s500.groupby("author")["id"].first().reset_index()
+sample = s500.merge(first_ids, on=["author","id"])
+
+fig = px.line(
+    sample, x="window_index", y="flesch",
+    color="author", line_dash="genre",
+    color_discrete_map=COLOR_MAP,
+    labels={
+        "window_index":"Numéro de fenêtre (position dans le texte →)",
+        "flesch":"Score Flesch","author":"Auteur","genre":"Genre"
+    },
+    title="Lisibilité Flesch sur fenêtres glissantes — fenêtre 500 tokens"
+)
+fig.add_hline(y=70, line_dash="dot", line_color="green", opacity=0.4)
+fig.add_hline(y=30, line_dash="dot", line_color="orange", opacity=0.4)
+fig.update_layout(template=TEMPLATE, legend_title="Auteur / Genre")
+fig.show()
+```
+
+**Lecture des données :** les courbes glissantes montrent que le score Flesch
+varie significativement au sein d'un même roman. On alterne entre des passages
+complexes et plus faciles. Le coefficient s'homogénise en prenant des plus grande
+fenêtre. 
+
+## Loi de Zipf
+
+```{python}
+#| label: zipf-data
+#| include: false
+
+zipf_path = "data/zipf.csv"
+if os.path.exists(zipf_path):
+    zipf_pdf = pd.read_csv(zipf_path)
+    has_zipf = True
+else:
+    has_zipf = False
+```
+
+```{python}
+#| label: fig-zipf-author
+#| fig-cap: "Loi de Zipf — fréquence log₁₀ en fonction du rang, moyenne par auteur. La pente de la droite log-log (≈ −1) caractérise la loi de Zipf."
+
+if has_zipf:
+    genre_avg = (
+        zipf_pdf.groupby(["author","rank"])[["log_freq"]]
+        .mean().reset_index()
+    )
+    fig = px.line(
+        genre_avg, x="rank", y="log_freq", color="author",
+        log_x=True,
+        labels={"rank":"Rang (log₁₀)","log_freq":"Fréquence log₁₀","author":"Auteur"},
+        title="Loi de Zipf — distribution lexicale moyenne par auteur"
+    )
+    fig.update_layout(template=TEMPLATE)
+    fig.show()
+```
+
+**Interprétation :** Ces graphiques permettent de visualiser
+la diversité du champ lexical d'un auteur. On voit que tous
+les auteurs se situent dans la même zone, avec de légères
+différence qui ne semblent pas être liées au genre.
+
+## Segmentation dialogue / narration
+
+```{python}
+#| label: seg-data
+#| include: false
+
+seg_path = "data/segmentation.csv"
+if os.path.exists(seg_path):
+    seg_pdf = pd.read_csv(seg_path)
+    has_seg = True
+else:
+    # Tenter de calculer depuis annotated si les colonnes sont présentes
+    seg_cols = [c for c in df_annotated.columns if "dialog" in c]
+    has_seg = len(seg_cols) > 0
+    if has_seg:
+        seg_pdf = (
+            df_annotated
+            .groupby(["author","genre"])[seg_cols]
+            .mean().reset_index()
+        )
+```
+
+```{python}
+#| label: fig-segmentation
+#| fig-cap: "Proportion de lignes dialogue par auteur. Heuristique typographique : lignes commençant par «, », —."
+
+if has_seg and "avg_dialog_ratio" in seg_pdf.columns:
+    fig = px.bar(
+        seg_pdf, x="author", y="avg_dialog_ratio",
+        color="genre", barmode="group",
+        color_discrete_map={"romantic":"#636EFA","realism":"#EF553B"},
+        text_auto=".1%",
+        labels={"author":"Auteur","avg_dialog_ratio":"Ratio dialogue","genre":"Genre"},
+        title="Proportion de lignes dialogue par auteur"
+    )
+    fig.update_yaxes(tickformat=".0%")
+    fig.update_layout(template=TEMPLATE, legend_title="Genre",
+                      yaxis_title="Part de lignes dialogue [0% = tout narration]")
+    fig.show()
+```
+
+**Interprétation :** Les auteurs réalistes ont tendance à moins utiliser
+les dialogues. Cela semble cohérent avec les longues descriptions, fréquentes
+chez le courant des réalistes. On remarque tout de même qu'il est difficile de
+faire des généralités, Dickens possède beaucoup de dialogues. 
+
+---
+
+# Spark experience {#sec-perf}
+
+Lors de ce projet, nous avons rencontré de nombreux problèmes de mémoire.
+En effet, notre session spark s'execute en local, et notre corpus
+nécessite beaucoup de calculs. Dans un premier temps, nos manipulations
+sur les différents dataFrame spark n'étaient pas très bien optimisées et
+nous étions confrontés à de très nombreux crash, même en limitant à peu
+le nombre de livre par auteur.
+
+
+## Shuffles critiques identifiés grâce à SPARK UI
+
+![Vue des stages Spark UI](spark_ui.png)
+
+On remarque des shuffles particulièrement importants vers la fin de
+l'execution due aux toPandas() dans le script main et sliding_readability.
+
+
+On remarque aussi que les stage 12, 8 et 9 sont très couteux en calculs. Ils
+correspondent à l'execution de la pipeline. Leur execution prends 1 minutes chacun.
+
+## Stratégies de mitigation testées
+
+### Réduction de `shuffle.partitions`
+
+```python
+# Avant (défaut Spark)
+spark.conf.set("spark.sql.shuffle.partitions", "200")
+# Après (adapté au corpus local)
+spark.conf.set("spark.sql.shuffle.partitions", "20")
+```
+
+Impact mesuré via Spark UI : réduction du nombre de tasks de stage pour
+éviter d'avoir un très grand nombre de petite tâches (peu efficace vu notre
+corpus et l'execution locale).
+
+### Caching stratégique
+
+```{python}
+#| label: tbl-caching
+#| tbl-cap: "Impact mesuré du caching sur le workflow"
+
+cache_data = {
+    "Point de cache": [
+        "df.cache() après union",
+        "annotated_df.cache() après transform()",
+        "annotated_df.cache() après withColumn × 5",
+    ],
+    "Justification": [
+        "Évite de re-lire les fichiers source et de re-sérialiser les Row Python",
+        "Évite de re-exécuter toute la pipeline NLP (DocumentAssembler → POS) à chaque action",
+        "Évite de recalculer les 5 withColumn() avant chaque groupBy ou explode",
+    ],
+    "Gain observé": [
+        "Faible (corpus en mémoire Python déjà)",
+        "Majeur : la pipeline NLP est le goulot d'étranglement principal",
+        "Significatif : les expr() Spark SQL sont recalculées à chaque action sans cache",
+    ]
+}
+display(pd.DataFrame(cache_data).style.hide(axis="index"))
+```
+
+**Utilisation du cache ** `.cache()` conserve les données en mémoire JVM.
+Cela évite de répéter des calculs.
+
+
+---
+
+# Appendice — Code source {#sec-appendix}
+
+Les cellules ci-dessous affichent le contenu des fichiers Python **à la
+volée depuis le disque** : toute modification des scripts Python se reflète
+immédiatement au prochain rendu Quarto, sans copier-coller.
+
+```{python}
+#| label: src-loader
+#| include: false
+
+def show_source(filename, lang="python"):
+    """Lit un fichier Python et l'affiche comme bloc de code Markdown."""
+    path = os.path.join(SRC_DIR, filename)
+    if not os.path.exists(path):
+        display(Markdown(f"> Fichier `{filename}` introuvable dans `{SRC_DIR}`"))
+        return
+    with open(path, "r", encoding="utf-8") as f:
+        code = f.read()
+    display(Markdown(f"```{lang}\n{code}\n```"))
+```
+
+## `create_corpus.py` — Extraction et cache du corpus
+
+```{python}
+#| label: src-create-corpus
+#| echo: false
+
+show_source("create_corpus.py")
+```
+
+## `create_pipeline.py` — Pipeline Spark NLP
+
+```{python}
+#| label: src-create-pipeline
+#| echo: false
+
+show_source("create_pipeline.py")
+```
+
+## `stylometrie.py` — Fonctions Python pures
+
+```{python}
+#| label: src-stylometrie
+#| echo: false
+
+show_source("stylometrie.py")
+```
+
+## `sliding_readability.py` — Lisibilité glissante
+
+```{python}
+#| label: src-sliding
+#| echo: false
+
+show_source("sliding_readability.py")
+```
+
+## `zipf.py` — Loi de Zipf
+
+```{python}
+#| label: src-zipf
+#| echo: false
+
+show_source("zipf.py")
+```
+
+## `segment.py` — Segmentation dialogue / narration
+
+```{python}
+#| label: src-segment
+#| echo: false
+
+show_source("segment.py")
+```
+
+## `visualize.py` — Visualisations Plotly
+
+```{python}
+#| label: src-visualize
+#| echo: false
+
+show_source("visualize.py")
+```
+
+## `save.py` — Sauvegarde Parquet / ORC
+
+```{python}
+#| label: src-save
+#| echo: false
+
+show_source("save.py")
+```
+
+## `main.py` — Point d'entrée
+
+```{python}
+#| label: src-main
+#| echo: false
+
+show_source("main.py")
+```
