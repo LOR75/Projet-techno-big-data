@@ -132,7 +132,6 @@ annotated_df = annotated_df \
     ) \
     .cache()
 
-  # force la matérialisation des nouveaux calculs
 
 # Agrégation par auteur × genre : moyennes des scores
 author_stats = annotated_df.groupBy("author", "genre").agg(
