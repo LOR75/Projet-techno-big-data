@@ -1,0 +1,7 @@
+author,genre,avg_dialog_ratio,avg_dialog_lines,avg_narration_lines,nb_texts
+dumas,romantic,0.47220174660194286,967.5,924.3,10
+balzac,romantic,0.4788647369432472,331.3,1594.2,10
+sand,romantic,0.4319499074784533,375.2,460.8,10
+zola,realism,0.3617406952181068,370.4,666.5,10
+maupassant,realism,0.3099740236319078,490.0,1085.0,10
+dickens,realism,0.5038848771221379,609.0,562.6,10
