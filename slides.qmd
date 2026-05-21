@@ -86,8 +86,9 @@ else:
         seg_pdf = df_annotated.groupby(["author","genre"])[seg_cols].mean().reset_index()
 ```
 
----
 ## Corpus
+
+Gutenberg, Bibliothèque électronique du Québec, Github
 
 ---
 
@@ -105,6 +106,8 @@ else:
 ---
 
 ## Kandel-Moles moyen par auteur
+
+KM = 207 − (1.015 × ASL) − (73.6 × ASW)
 
 ```{python}
 fig = px.bar(
