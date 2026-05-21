@@ -186,24 +186,49 @@ fig.show()
 
 ---
 
-## Loi de Zipf par genre
+## Loi de Zipf par auteur
 
 ```{python}
 if has_zipf:
-    genre_avg = (
-        zipf_pdf.groupby(["genre","rank"])[["log_freq"]]
-        .mean().reset_index()
+
+    first_ids = (
+        zipf_pdf
+        .sort_values("frequency", ascending=False)
+        .drop_duplicates(subset="author")[["author", "id"]]
+        .rename(columns={"id": "first_id"})
     )
-    fig = px.line(
-        genre_avg, x="rank", y="log_freq", color="genre",
-        log_x=True,
-        labels={"rank":"Rang (log₁₀)","log_freq":"Fréquence log₁₀","genre":"Genre"},
+
+    sample = zipf_pdf.merge(first_ids, on="author")
+    sample = sample[sample["id"] == sample["first_id"]].copy()
+    sample = sample.sort_values("frequency", ascending=False)
+    sample = sample.groupby("author").head(50)
+    sample = sample.reset_index(drop=True)
+
+    fig_scatter = px.scatter(
+        sample,
+        x="log_rank",
+        y="log_freq",
+        color="author",
+        text="word",           # label = le mot lui-même
+        title="Zipf log-log — mots caractéristiques par auteur (1 texte représentatif)",
+        labels={
+            "log_rank": "log₁₀(rang)",
+            "log_freq": "log₁₀(fréquence)",
+            "author"  : "Auteur"
+        },
     )
-    fig.update_layout(template=TEMPLATE, legend_title="Genre",
-                      margin=dict(t=20), height=430)
-    fig.show()
-else:
-    display(Markdown("> `data/zipf.csv` introuvable — ajoutez `zipf_pdf.to_csv('data/zipf.csv', index=False)` dans `main.py`"))
+    fig_scatter.update_traces(
+        textposition="top center",
+        marker=dict(size=5)
+    )
+    fig_scatter.update_layout(
+        template="plotly_white",
+        xaxis_title="log₁₀(rang du mot)",
+        yaxis_title="log₁₀(fréquence du mot)",
+        legend_title="Auteur",
+    )
+
+    fig_scatter.show()
 ```
 
 ---
