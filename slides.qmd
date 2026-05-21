@@ -181,7 +181,7 @@ fig.show()
 
 ---
 
-## Loi de Zipf par autheur
+## Loi de Zipf par auteur
 
 ```{python}
 if has_zipf:
