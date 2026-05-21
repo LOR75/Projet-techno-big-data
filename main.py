@@ -29,8 +29,7 @@ os.environ["PYSPARK_DRIVER_PYTHON"] = sys.executable  #Python utilisé par le ma
 
 spark = sparknlp.start()
 
-# CORRECTION 1 : shuffle.partitions abaissé de 200 à 8 pour un usage local mono-nœud.
-# 200 partitions vides génèrent une surcharge mémoire et CPU sans bénéfice.
+
 spark.conf.set("spark.sql.shuffle.partitions", "8")
 spark.conf.set("spark.default.parallelism",    "8")
 

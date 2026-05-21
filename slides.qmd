@@ -133,6 +133,8 @@ pdf = (
     .reset_index()
 )
 
+pdf = pdf.dropna(subset=["avg_words", "avg_sentences"])
+
 fig = px.scatter(
     pdf,
     x="avg_sentences",
@@ -181,16 +183,16 @@ fig.show()
 
 ---
 
-## Loi de Zipf par auteur
+## Loi de Zipf par genre
 
 ```{python}
 if has_zipf:
     genre_avg = (
-        zipf_pdf.groupby(["author","rank"])[["log_freq"]]
+        zipf_pdf.groupby(["genre","rank"])[["log_freq"]]
         .mean().reset_index()
     )
     fig = px.line(
-        genre_avg, x="rank", y="log_freq", color="author",
+        genre_avg, x="rank", y="log_freq", color="genre",
         log_x=True,
         labels={"rank":"Rang (log₁₀)","log_freq":"Fréquence log₁₀","genre":"Genre"},
     )
