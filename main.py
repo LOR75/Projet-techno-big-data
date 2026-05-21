@@ -83,7 +83,6 @@ annotated_df = model.transform(df).cache()  # mise en cache après la première 
 
 from pyspark.sql.functions import col, size, expr, avg
 
-_ = annotated_df.count()   # force la matérialisation du cache NLP
 
 
 # df n'est plus utilisé jusqu'à save_results ; on le dépersiste pour récupérer la mémoire.
@@ -133,7 +132,7 @@ annotated_df = annotated_df \
     ) \
     .cache()
 
-_ = annotated_df.count()   # force la matérialisation des nouveaux calculs
+  # force la matérialisation des nouveaux calculs
 
 # Agrégation par auteur × genre : moyennes des scores
 author_stats = annotated_df.groupBy("author", "genre").agg(

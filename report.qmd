@@ -595,12 +595,9 @@ le nombre de livre par auteur.
 
 ![Vue des stages Spark UI](spark_ui.png)
 
-On remarque des shuffles particulièrement importants vers la fin de
-l'execution due aux toPandas() dans le script main et sliding_readability.
-
-
-On remarque aussi que les stage 12, 8 et 9 sont très couteux en calculs. Ils
-correspondent à l'execution de la pipeline. Leur execution prends 1 minutes chacun.
+On remarque une opération particulièrement lourde (le stage 7).
+Elle correspond à la mise en mémoire du dataframe spark après
+avoir appliqué la pipeline.
 
 ## Stratégies de mitigation testées
 

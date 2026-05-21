@@ -227,7 +227,6 @@ if has_zipf:
         yaxis_title="log₁₀(fréquence du mot)",
         legend_title="Auteur",
     )
-
     fig_scatter.show()
 ```
 
