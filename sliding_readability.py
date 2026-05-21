@@ -44,6 +44,12 @@ def compute_sliding_readability(annotated_df, window_configs=None):
         )
     ).cache()  # réutilisé pour chaque config → mise en cache
 
+    # CORRECTION 7 : matérialisation explicite de tokens_df avant la boucle.
+    # Sans ce count(), le cache n'est effectif qu'à la première action dans la boucle,
+    # ce qui peut provoquer un recalcul complet du posexplode à chaque itération
+    # si Spark invalide le plan entre les deux configs.
+    _ = tokens_df.count()
+
     dfs = []
     for ws, st in window_configs:
 
@@ -89,6 +95,10 @@ def compute_sliding_readability(annotated_df, window_configs=None):
     result = dfs[0]
     for d in dfs[1:]:
         result = result.union(d)
+
+    # CORRECTION 8 : libération de tokens_df après la construction du plan logique.
+    # tokens_df n'est plus nécessaire une fois les DataFrames windowed créés.
+    tokens_df.unpersist()
 
     return result
 
