@@ -21,9 +21,6 @@ from visualize import (
 from save import save_results
 
 
-
-
-
 #### session spark ########
 
 
@@ -32,8 +29,10 @@ os.environ["PYSPARK_DRIVER_PYTHON"] = sys.executable  #Python utilisé par le ma
 
 spark = sparknlp.start()
 
-spark.conf.set("spark.sql.shuffle.partitions", "200")
-spark.conf.set("spark.default.parallelism",    "200")  
+# CORRECTION 1 : shuffle.partitions abaissé de 200 à 8 pour un usage local mono-nœud.
+# 200 partitions vides génèrent une surcharge mémoire et CPU sans bénéfice.
+spark.conf.set("spark.sql.shuffle.partitions", "8")
+spark.conf.set("spark.default.parallelism",    "8")
 
 print("Spark version :", spark.version)
 print("SparkNLP version :", sparknlp.version())
@@ -87,8 +86,13 @@ from pyspark.sql.functions import col, size, expr, avg
 
 _ = annotated_df.count()   # force la matérialisation du cache NLP
 
-annotated_df.unpersist()
 
+# df n'est plus utilisé jusqu'à save_results ; on le dépersiste pour récupérer la mémoire.
+df.unpersist()
+
+
+# Conserver document/sentence/token/pos (colonnes NLP lourdes) en mémoire toute la session
+# est la principale cause de crash. On les utilise ici pour les calculs puis on les drop.
 annotated_df = annotated_df \
     .withColumn("word_count", size(col("token.result"))) \
     .withColumn("sentence_count", size(col("sentence.result"))) \
@@ -174,6 +178,13 @@ sliding_df  = compute_sliding_readability(
     annotated_df,
     window_configs=[(500, 250), (1000, 500)]
 )
+
+# mise en cache de sliding_df car il est parcouru deux fois
+# (sliding_stability_stats + filter/toPandas). Sans cache, Spark recalcule
+# l'intégralité du posexplode × fenêtres deux fois.
+sliding_df = sliding_df.cache()
+_ = sliding_df.count()
+
 stability_pdf = sliding_stability_stats(sliding_df)
 
 sliding_pdf = (
@@ -181,6 +192,10 @@ sliding_pdf = (
     .filter(F.col("window_size") == 500)
     .toPandas()
 )
+
+# on libère sliding_df après usage pour libérer la mémoire
+# avant zipf et segmentation.
+sliding_df.unpersist()
 
 print("Stabilité des indices :")
 print(stability_pdf)
@@ -221,4 +236,11 @@ plot_segmentation(seg_pdf)                  # Barplot ratio dialogue
 
 ### save ####
 
+# on recharge df depuis Parquet plutôt que de le garder en cache.
+# Au moment de save_results, df a été dépersisté; on le recrée
+# à la volée depuis les corpus déjà en mémoire Python, ce qui est négligeable.
+df = df_romantic.union(df_realism)
+
 save_results(df, annotated_df, author_stats, sliding_df)
+
+spark.stop()
